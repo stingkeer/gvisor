@@ -813,6 +813,24 @@ func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
 	return mounts, nil
 }
 
+func (c *containerMounter) mountIsFile(ctx context.Context, creds *auth.Credentials, mnt *vfs.Mount) (bool, error) {
+	vd := vfs.MakeVirtualDentry(mnt, mnt.Root())
+	stat, err := c.k.VFS().StatAt(ctx, creds, &vfs.PathOperation{
+		Root:  vd,
+		Start: vd,
+	}, &vfs.StatOptions{
+		Mask: linux.STATX_TYPE,
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to stat mount's root: %v", err)
+	}
+	if stat.Mask&linux.STATX_TYPE == 0 {
+		return false, fmt.Errorf("failed to get file type of mount's root")
+	}
+	rootType := stat.Mode & linux.S_IFMT
+	return rootType != linux.S_IFDIR, nil
+}
+
 func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountInfo) (*vfs.Mount, error) {
 	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.productName, c.containerName)
 	if err != nil {
@@ -821,10 +839,6 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 	if len(fsName) == 0 {
 		// Filesystem is not supported (e.g. cgroup), just skip it.
 		return nil, nil
-	}
-
-	if err := c.makeMountPoint(ctx, creds, mns, submount.mount.Destination); err != nil {
-		return nil, fmt.Errorf("creating mount point %q: %w", submount.mount.Destination, err)
 	}
 
 	if submount.goferMountConf.ShouldUseOverlayfs() {
@@ -845,10 +859,24 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 		Start: root,
 		Path:  fspath.Parse(submount.mount.Destination),
 	}
-	mnt, err := c.k.VFS().MountAt(ctx, creds, "", target, fsName, opts)
+	mnt, err := c.k.VFS().MountDisconnected(ctx, creds, "", fsName, opts)
 	if err != nil {
+		return nil, err
+	}
+	defer mnt.DecRef(ctx)
+
+	isFile, err := c.mountIsFile(ctx, creds, mnt)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.makeMountPoint(ctx, creds, mns, submount.mount.Destination, isFile); err != nil {
+		return nil, fmt.Errorf("creating mount point %q: %w", submount.mount.Destination, err)
+	}
+
+	if err := c.k.VFS().ConnectMountAt(ctx, creds, mnt, target); err != nil {
 		return nil, fmt.Errorf("failed to mount %q (type: %s): %w, opts: %v", submount.mount.Destination, submount.mount.Type, err, opts)
 	}
+
 	log.Infof("Mounted %q to %q type: %s, internal-options: %q", submount.mount.Source, submount.mount.Destination, submount.mount.Type, opts.GetFilesystemOptions.Data)
 	return mnt, nil
 }
@@ -1169,7 +1197,7 @@ func (c *containerMounter) mountCgroupSubmounts(ctx context.Context, spec *specs
 
 		// Bind mount the new cgroup directory into the container's mount namespace.
 		destination := "/sys/fs/cgroup/" + ctrlName
-		if err := c.k.VFS().MakeSyntheticMountpoint(mountCtx, destination, root, creds); err != nil {
+		if err := c.k.VFS().MakeSyntheticMountpoint(mountCtx, destination, root, creds, false); err != nil {
 			// Log a warning, but attempt the mount anyway.
 			log.Warningf("Failed to create mount point %q: %v", destination, err)
 		}
@@ -1225,7 +1253,7 @@ func (c *containerMounter) mountSharedSubmount(ctx context.Context, conf *config
 		Path:  fspath.Parse(mntInfo.mount.Destination),
 	}
 
-	if err := c.makeMountPoint(ctx, creds, mns, mntInfo.mount.Destination); err != nil {
+	if err := c.makeMountPoint(ctx, creds, mns, mntInfo.mount.Destination, false); err != nil {
 		return nil, fmt.Errorf("creating mount point %q: %w", mntInfo.mount.Destination, err)
 	}
 
@@ -1236,7 +1264,7 @@ func (c *containerMounter) mountSharedSubmount(ctx context.Context, conf *config
 	return newMnt, nil
 }
 
-func (c *containerMounter) makeMountPoint(ctx context.Context, creds *auth.Credentials, mns *vfs.MountNamespace, dest string) error {
+func (c *containerMounter) makeMountPoint(ctx context.Context, creds *auth.Credentials, mns *vfs.MountNamespace, dest string, isFile bool) error {
 	root := mns.Root(ctx)
 	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
@@ -1253,7 +1281,7 @@ func (c *containerMounter) makeMountPoint(ctx context.Context, creds *auth.Crede
 		vd.DecRef(ctx)
 		return nil
 	}
-	return c.k.VFS().MakeSyntheticMountpoint(ctx, dest, root, creds)
+	return c.k.VFS().MakeSyntheticMountpoint(ctx, dest, root, creds, isFile)
 }
 
 // configureRestore returns an updated context.Context including filesystem

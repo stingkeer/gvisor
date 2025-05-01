@@ -905,12 +905,30 @@ func (vfs *VirtualFilesystem) MkdirAllAt(ctx context.Context, currentPath string
 // MakeSyntheticMountpoint creates parent directories of target if they do not
 // exist and attempts to create a directory for the mountpoint. If a
 // non-directory file already exists there then we allow it.
-func (vfs *VirtualFilesystem) MakeSyntheticMountpoint(ctx context.Context, target string, root VirtualDentry, creds *auth.Credentials) error {
+func (vfs *VirtualFilesystem) MakeSyntheticMountpoint(ctx context.Context, target string, root VirtualDentry, creds *auth.Credentials, isFile bool) error {
 	mkdirOpts := &MkdirOptions{Mode: 0777, ForSyntheticMountpoint: true}
 
 	// Make sure the parent directory of target exists.
 	if err := vfs.MkdirAllAt(ctx, path.Dir(target), root, creds, mkdirOpts, true /* mustBeDir */); err != nil {
 		return fmt.Errorf("failed to create parent directory of mountpoint %q: %w", target, err)
+	}
+
+	if isFile {
+		mknodOpts := &MknodOptions{
+			Mode: linux.FileMode(linux.S_IFREG | 0644),
+		}
+		pop := &PathOperation{
+			Root:  root,
+			Start: root,
+			Path:  fspath.Parse(target),
+		}
+		// Attempt to mkdir the final component. If a file (of any type) exists
+		// then we let allow mounting on top of that because we do not require the
+		// target to be an existing directory, unlike Linux mount(2).
+		if err := vfs.MknodAt(ctx, creds, pop, mknodOpts); err != nil {
+			return fmt.Errorf("failed to create file mountpoint %q: %w", target, err)
+		}
+		return nil
 	}
 
 	// Attempt to mkdir the final component. If a file (of any type) exists
