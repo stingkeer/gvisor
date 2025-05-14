@@ -30,6 +30,7 @@ package tcpip
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -375,7 +376,6 @@ func (m AddressMask) Len() int {
 	return m.length
 }
 
-// Prefix returns the number of bits before the first host bit.
 func (m AddressMask) Prefix() int {
 	p := 0
 	for _, b := range m.mask[:m.length] {
@@ -1602,11 +1602,18 @@ type TransportProtocolNumber uint32
 // See: https://www.iana.org/assignments/ieee-802-numbers/ieee-802-numbers.xhtml
 type NetworkProtocolNumber uint32
 
+var _ json.Marshaler = (*StatCounter)(nil)
+
 // A StatCounter keeps track of a statistic.
 //
 // +stateify savable
 type StatCounter struct {
 	count atomicbitops.Uint64
+}
+
+// MarshalJSON implements json.Marshaler.
+func (s *StatCounter) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf("%d", s.count.Load())), nil
 }
 
 // Increment adds one to the counter.

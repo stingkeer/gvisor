@@ -360,7 +360,7 @@ func filterAddress(addr, mask, filterAddr tcpip.Address, invert bool) bool {
 	maskBytes := mask.AsSlice()
 	filterBytes := filterAddr.AsSlice()
 	for i := range filterAddr.AsSlice() {
-		if addrBytes[i]&maskBytes[i] != filterBytes[i] {
+		if addrBytes[i]&maskBytes[i] != filterBytes[i]&maskBytes[i] {
 			matches = false
 			break
 		}

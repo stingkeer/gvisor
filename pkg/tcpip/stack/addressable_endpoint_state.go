@@ -17,6 +17,7 @@ package stack
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
@@ -328,6 +329,19 @@ func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.Address
 	}
 
 	addrState.notifyChangedLocked()
+
+	//clear old endpoints
+	//TODO FIXME
+	if len(a.endpoints) > 1000 {
+		log.Log().Warningf("AddressableEndpointState > 1000 %d", len(a.endpoints))
+		for _, v := range a.endpoints {
+			if v.kind == Temporary {
+				a.releaseAddressStateLocked(v)
+			}
+		}
+		log.Log().Warningf("AddressableEndpointState clear after %d", len(a.endpoints))
+	}
+
 	return addrState, nil
 }
 
@@ -781,15 +795,15 @@ func (a *addressState) Subnet() tcpip.Subnet {
 
 // GetKind implements AddressEndpoint.
 func (a *addressState) GetKind() AddressKind {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	// a.mu.RLock()
+	// defer a.mu.RUnlock()
 	return a.kind
 }
 
 // SetKind implements AddressEndpoint.
 func (a *addressState) SetKind(kind AddressKind) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	// a.mu.Lock()
+	// defer a.mu.Unlock()
 
 	prevKind := a.kind
 	a.kind = kind

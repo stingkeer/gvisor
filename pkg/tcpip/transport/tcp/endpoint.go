@@ -2917,6 +2917,9 @@ func (e *Endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 
 	if e.EndpointState().connecting() {
 		e.mu.Lock()
+		if e.h == nil {
+			return
+		}
 		if lEP := e.h.listenEP; lEP != nil {
 			// Remove from listening endpoints pending list.
 			lEP.acceptMu.Lock()
