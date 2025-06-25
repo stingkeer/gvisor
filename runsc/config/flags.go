@@ -44,13 +44,16 @@ const (
 	flagOCISeccomp        = "oci-seccomp"
 	flagOverlay2          = "overlay2"
 	flagAllowFlagOverride = "allow-flag-override"
+
+	defaultRootDir      = "/var/run/runsc"
+	xdgRuntimeDirEnvVar = "XDG_RUNTIME_DIR"
 )
 
 // RegisterFlags registers flags used to populate Config.
 func RegisterFlags(flagSet *flag.FlagSet) {
 	// Although these flags are not part of the OCI spec, they are used by
 	// Docker, and thus should not be changed.
-	flagSet.String("root", "", "root directory for storage of container state.")
+	flagSet.String("root", "", fmt.Sprintf("root directory for storage of container state, defaults are $%s/runsc, %s.", xdgRuntimeDirEnvVar, defaultRootDir))
 	flagSet.String("log", "", "file path where internal debug information is written, default is stdout.")
 	flagSet.String("log-format", "text", "log format: text (default), json, or json-k8s.")
 	flagSet.Bool(flagDebug, false, "enable debug logging.")
@@ -116,7 +119,12 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
 	flagSet.Var(fileAccessTypePtr(FileAccessShared), "file-access-mounts", "specifies which filesystem validation to use for volumes other than the root mount: shared (default), exclusive.")
 	flagSet.Bool("overlay", false, "DEPRECATED: use --overlay2=all:memory to achieve the same effect")
-	flagSet.Var(defaultOverlay2(), flagOverlay2, "wrap mounts with overlayfs. Format is {mount}:{medium}, where 'mount' can be 'root' or 'all' and medium can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created. 'none' will turn overlay mode off.")
+	flagSet.Var(defaultOverlay2(), flagOverlay2, "wrap mounts with overlayfs. Format is\n"+
+		"* 'none' to turn overlay mode off\n"+
+		"* {mount}:{medium}[,size={size}], where\n"+
+		"    'mount' can be 'root' or 'all'\n"+
+		"    'medium' can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created\n"+
+		"    'size' optional parameter overrides default overlay upper layer size\n")
 	flagSet.Bool("fsgofer-host-uds", false, "DEPRECATED: use host-uds=all")
 	flagSet.Var(hostUDSPtr(HostUDSNone), flagHostUDS, "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
 	flagSet.Var(hostFifoPtr(HostFifoNone), "host-fifo", "controls permission to access host FIFOs (or named pipes). Values: none|open, default: none")
@@ -131,6 +139,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Int("dcache", -1, "Set the global dentry cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If negative, per-mount caches are used.")
 	flagSet.Bool("iouring", false, "TEST ONLY; Enables io_uring syscalls in the sentry. Support is experimental and very limited.")
 	flagSet.Bool("directfs", true, "directly access the container filesystems from the sentry. Sentry runs with higher privileges.")
+	flagSet.Bool("TESTONLY-nftables", false, "TEST ONLY; Enables nftables support in the sentry.")
 
 	// Flags that control sandbox runtime behavior: network related.
 	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none. Using network inside the sandbox is more secure because it's isolated from the host network.")
@@ -149,6 +158,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("reproduce-nat", false, "Scrape the host netns NAT table and reproduce it in the sandbox.")
 	flagSet.Bool(flagReproduceNFTables, false, "Attempt to scrape and reproduce nftable rules inside the sandbox. Overrides reproduce-nat when true.")
 	flagSet.Bool(flagNetDisconnectOK, true, "Indicates whether open network connections and open unix domain sockets should be disconnected upon save.")
+	flagSet.Bool("save-restore-netstack", true, "Indicates whether netstack save/restore is enabled.")
 
 	// Flags that control sandbox runtime behavior: accelerator related.
 	flagSet.Bool("nvproxy", false, "EXPERIMENTAL: enable support for Nvidia GPUs")
@@ -164,7 +174,6 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("TESTONLY-afs-syscall-panic", false, "TEST ONLY; do not ever use! Used for tests exercising gVisor panic reporting.")
 	flagSet.String("TESTONLY-autosave-image-path", "", "TEST ONLY; enable auto save for syscall tests and set path for state file.")
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
-	flagSet.Bool("TESTONLY-save-restore-netstack", false, "TEST ONLY; enable save/restore for netstack.")
 }
 
 // overrideAllowlist lists all flags that can be changed using OCI
@@ -252,9 +261,9 @@ func NewFromFlags(flagSet *flag.FlagSet) (*Config, error) {
 
 	if len(conf.RootDir) == 0 {
 		// If not set, set default root dir to something (hopefully) user-writeable.
-		conf.RootDir = "/var/run/runsc"
+		conf.RootDir = defaultRootDir
 		// NOTE: empty values for XDG_RUNTIME_DIR should be ignored.
-		if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+		if runtimeDir := os.Getenv(xdgRuntimeDirEnvVar); runtimeDir != "" {
 			conf.RootDir = filepath.Join(runtimeDir, "runsc")
 		}
 	}

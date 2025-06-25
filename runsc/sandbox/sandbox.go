@@ -535,7 +535,6 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("opening restore pages file %q failed: %v", pagesFileName, err)
-
 	} else {
 		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
 	}
@@ -1470,8 +1469,11 @@ func (s *Sandbox) Checkpoint(cid string, imagePath string, direct bool, sfOpts s
 		FilePayload: urpc.FilePayload{
 			Files: files,
 		},
-		HavePagesFile: len(files) > 1,
-		Resume:        sfOpts.Resume,
+		HavePagesFile:              len(files) > 1,
+		Resume:                     sfOpts.Resume,
+		SaveRestoreExecArgv:        sfOpts.SaveRestoreExecArgv,
+		SaveRestoreExecTimeout:     sfOpts.SaveRestoreExecTimeout,
+		SaveRestoreExecContainerID: sfOpts.SaveRestoreExecContainerID,
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {

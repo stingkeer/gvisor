@@ -24,7 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
-	pb "gvisor.dev/gvisor/pkg/sentry/control/control_go_proto"
+	pb "gvisor.dev/gvisor/pkg/sentry/control/control_api_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -40,12 +40,12 @@ type Lifecycle struct {
 	// Kernel is the kernel where the tasks belong to.
 	Kernel *kernel.Kernel
 
+	// mu protects the fields below.
+	mu sync.RWMutex
+
 	// ShutdownCh is the channel used to signal the sentry to shutdown
 	// the sentry/sandbox.
 	ShutdownCh chan struct{}
-
-	// mu protects the fields below.
-	mu sync.RWMutex
 
 	// MountNamespacesMap is a map of container id/names and the mount
 	// namespaces.
@@ -353,6 +353,7 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 	l.mu.Unlock()
 
 	// Start the newly created process.
+	timeContainerProcessStarting := time.Now()
 	l.Kernel.StartProcess(tg)
 	log.Infof("Started the new container %v ", initArgs.ContainerID)
 
@@ -367,6 +368,10 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 		Started:         true,
 		ContainerId:     initArgs.ContainerID,
 		RequestReceived: timeRequestReceived,
+		ContainerProcessStarting: &timestamppb.Timestamp{
+			Seconds: timeContainerProcessStarting.Unix(),
+			Nanos:   int32(timeContainerProcessStarting.Nanosecond()),
+		},
 		RequestCompleted: &timestamppb.Timestamp{
 			Seconds: timeRequestCompleted.Unix(),
 			Nanos:   int32(timeRequestCompleted.Nanosecond()),
@@ -393,7 +398,12 @@ func (l *Lifecycle) reap(containerID string, tg *kernel.ThreadGroup) {
 
 // Shutdown sends signal to destroy the sentry/sandbox.
 func (l *Lifecycle) Shutdown(_, _ *struct{}) error {
-	close(l.ShutdownCh)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ShutdownCh != nil {
+		close(l.ShutdownCh)
+		l.ShutdownCh = nil
+	}
 	return nil
 }
 

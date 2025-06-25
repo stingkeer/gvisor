@@ -899,7 +899,7 @@ func (c *Container) forEachSelfMount(fn func(mountSrc string)) {
 	}
 }
 
-func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mountSrc string) (boot.GoferMountConf, error) {
+func createGoferConf(overlayMedium config.OverlayMedium, overlaySize string, mountType string, mountSrc string) (boot.GoferMountConf, error) {
 	var lower boot.GoferMountConfLowerType
 	switch mountType {
 	case boot.Bind:
@@ -915,7 +915,7 @@ func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mount
 	case config.NoOverlay:
 		return boot.GoferMountConf{Lower: lower, Upper: boot.NoOverlay}, nil
 	case config.MemoryOverlay:
-		return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay}, nil
+		return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay, Size: overlaySize}, nil
 	case config.SelfOverlay:
 		mountSrcInfo, err := os.Stat(mountSrc)
 		if err != nil {
@@ -923,12 +923,12 @@ func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mount
 		}
 		if !mountSrcInfo.IsDir() {
 			log.Warningf("self filestore is only supported for directory mounts, but mount %q is not a directory, falling back to memory", mountSrc)
-			return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay}, nil
+			return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay, Size: overlaySize}, nil
 		}
-		return boot.GoferMountConf{Lower: lower, Upper: boot.SelfOverlay}, nil
+		return boot.GoferMountConf{Lower: lower, Upper: boot.SelfOverlay, Size: overlaySize}, nil
 	default:
 		if overlayMedium.IsBackedByAnon() {
-			return boot.GoferMountConf{Lower: lower, Upper: boot.AnonOverlay}, nil
+			return boot.GoferMountConf{Lower: lower, Upper: boot.AnonOverlay, Size: overlaySize}, nil
 		}
 		return boot.GoferMountConf{}, fmt.Errorf("unexpected overlay medium %q", overlayMedium)
 	}
@@ -939,17 +939,19 @@ func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mount
 func (c *Container) initGoferConfs(ovlConf config.Overlay2, mountHints *boot.PodMountHints, rootfsHint *boot.RootfsHint) error {
 	// Handle root mount first.
 	overlayMedium := ovlConf.RootOverlayMedium()
+	overlaySize := ovlConf.RootOverlaySize()
 	mountType := boot.Bind
 	if rootfsHint != nil {
 		overlayMedium = rootfsHint.Overlay
 		if !specutils.IsGoferMount(rootfsHint.Mount) {
 			mountType = rootfsHint.Mount.Type
 		}
+		overlaySize = rootfsHint.Size
 	}
 	if c.Spec.Root.Readonly {
 		overlayMedium = config.NoOverlay
 	}
-	goferConf, err := createGoferConf(overlayMedium, mountType, c.Spec.Root.Path)
+	goferConf, err := createGoferConf(overlayMedium, overlaySize, mountType, c.Spec.Root.Path)
 	if err != nil {
 		return err
 	}
@@ -960,20 +962,22 @@ func (c *Container) initGoferConfs(ovlConf config.Overlay2, mountHints *boot.Pod
 		if !specutils.IsGoferMount(c.Spec.Mounts[i]) {
 			continue
 		}
-		overlayMedium = ovlConf.SubMountOverlayMedium()
+		overlayMedium := ovlConf.SubMountOverlayMedium()
+		overlaySize := ovlConf.SubMountOverlaySize()
 		mountType = boot.Bind
 		if specutils.IsReadonlyMount(c.Spec.Mounts[i].Options) {
 			overlayMedium = config.NoOverlay
 		}
-		if hint := mountHints.FindMount(c.Spec.Mounts[i].Source); hint != nil {
+		if hint := mountHints.FindMount(c.Spec.Mounts[i].Source); hint != nil && hint.IsSandboxLocal() {
 			// Note that we want overlayMedium=self even if this is a read-only mount so that
 			// the shared mount is created correctly. Future containers may mount this writably.
 			overlayMedium = config.SelfOverlay
 			if !specutils.IsGoferMount(hint.Mount) {
 				mountType = hint.Mount.Type
 			}
+			overlaySize = ""
 		}
-		goferConf, err := createGoferConf(overlayMedium, mountType, c.Spec.Mounts[i].Source)
+		goferConf, err := createGoferConf(overlayMedium, overlaySize, mountType, c.Spec.Mounts[i].Source)
 		if err != nil {
 			return err
 		}
@@ -2067,6 +2071,10 @@ func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
 		fmt.Sprintf("--pid=%d", goferPid),
 		fmt.Sprintf("--device=%s", devices),
 	}
+	if nvidiaContainerCliConfigureNeedsCudaCompatModeFlag(cliPath) {
+		// "mount" is the flag's intended default value.
+		argv = append(argv, "--cuda-compat-mode=mount")
+	}
 	// Pass driver capabilities allowed by configuration as flags. See
 	// nvidia-container-toolkit/cmd/nvidia-container-runtime-hook/main.go:doPrestart().
 	driverCaps, err := specutils.NVProxyDriverCapsFromEnv(spec, conf)
@@ -2089,6 +2097,43 @@ func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
 		return fmt.Errorf("nvidia-container-cli configure failed, err: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
 	}
 	return nil
+}
+
+func nvidiaContainerCliConfigureNeedsCudaCompatModeFlag(cliPath string) bool {
+	cmd := exec.Cmd{
+		Path: cliPath,
+		Args: []string{cliPath, "--version"},
+	}
+	log.Debugf("Executing %q", cmd.Args)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Warningf("Failed to execute nvidia-container-cli --version: %v", err)
+		return false
+	}
+	m := regexp.MustCompile(`^cli-version: (\d+)\.(\d+)\.(\d+)`).FindSubmatch(out)
+	if m == nil {
+		log.Warningf("Failed to find version number in nvidia-container-cli --version: %s", out)
+		return false
+	}
+	major, err := strconv.Atoi(string(m[1]))
+	if err != nil {
+		log.Warningf("Invalid major version number in nvidia-container-cli --version: %v", err)
+		return false
+	}
+	minor, err := strconv.Atoi(string(m[2]))
+	if err != nil {
+		log.Warningf("Invalid minor version number in nvidia-container-cli --version: %v", err)
+		return false
+	}
+	release, err := strconv.Atoi(string(m[3]))
+	if err != nil {
+		log.Warningf("Invalid release version number in nvidia-container-cli --version: %v", err)
+		return false
+	}
+	// In nvidia-container-cli 1.17.7, in which the --cuda-compat-mode flag
+	// first appears, failing to pass this flag to nvidia-container-cli
+	// configure causes all other flags to be ignored.
+	return major == 1 && minor == 17 && release == 7
 }
 
 // CheckStopped checks if the container is stopped and updates its status.

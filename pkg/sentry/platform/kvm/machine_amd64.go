@@ -50,10 +50,12 @@ func (m *machine) initArchState() error {
 
 	// Initialize all vCPUs to minimize kvm ioctl-s allowed by seccomp filters.
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i := 0; i < m.maxVCPUs; i++ {
-		m.createVCPU(i)
+		if _, err := m.createVCPU(i); err != nil {
+			return err
+		}
 	}
-	m.mu.Unlock()
 
 	return nil
 }
@@ -494,6 +496,31 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	}
 }
 
+func (m *machine) mapUpperHalfRegion(
+	pageTable *pagetables.PageTables,
+	virtual uintptr, length uintptr,
+	opts pagetables.MapOpts,
+) {
+	for length != 0 {
+		physical, plength, ok := translateToPhysical(virtual)
+		if !ok || plength == 0 {
+			panic(fmt.Sprintf("impossible translation: virtual %x length %x", virtual, length))
+		}
+		if plength > length {
+			plength = length
+		}
+
+		pageTable.Map(
+			hostarch.Addr(ring0.KernelStartAddress|virtual),
+			plength,
+			opts,
+			physical)
+
+		length -= plength
+		virtual += plength
+	}
+}
+
 func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 	// Map all the executable regions so that all the entry functions
 	// are mapped in the upper half.
@@ -504,30 +531,16 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 
 		if vr.accessType.Execute {
 			r := vr.region
-			physical, length, ok := translateToPhysical(r.virtual)
-			if !ok || length < r.length {
-				panic("impossible translation")
-			}
-			pageTable.Map(
-				hostarch.Addr(ring0.KernelStartAddress|r.virtual),
-				r.length,
-				pagetables.MapOpts{AccessType: hostarch.Execute, Global: true},
-				physical)
+			m.mapUpperHalfRegion(pageTable, r.virtual, r.length,
+				pagetables.MapOpts{AccessType: hostarch.Execute, Global: true})
 		}
 	}); err != nil {
 		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
 	}
 	for start, end := range m.kernel.EntryRegions() {
 		regionLen := end - start
-		physical, length, ok := translateToPhysical(start)
-		if !ok || length < regionLen {
-			panic("impossible translation")
-		}
-		pageTable.Map(
-			hostarch.Addr(ring0.KernelStartAddress|start),
-			regionLen,
-			pagetables.MapOpts{AccessType: hostarch.ReadWrite, Global: true},
-			physical)
+		m.mapUpperHalfRegion(pageTable, start, regionLen,
+			pagetables.MapOpts{AccessType: hostarch.ReadWrite, Global: true})
 	}
 }
 

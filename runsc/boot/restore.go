@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -40,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -83,6 +85,10 @@ type restorer struct {
 	// stateFile is a reader for the statefile.
 	stateFile io.ReadCloser
 
+	// timer is the timer for the restore process.
+	// The `restorer` owns the timer and will end it when restore is complete.
+	timer *timing.Timer
+
 	// If background is true, pagesFile may continue to be read after
 	// restorer.restore() returns.
 	background bool
@@ -111,7 +117,10 @@ type restorer struct {
 	checkpointedSpecs map[string]*specs.Spec
 }
 
-func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []GoferMountConf) error {
+// restoreSubcontainer restores a subcontainer.
+// `subcontainerTimeline` must either be nil or an orphaned timeline.
+// It takes ownership of subcontainerTimeline and will end it.
+func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []GoferMountConf, subcontainerTimeline *timing.Timeline) error {
 	containerName := l.registerContainer(spec, cid)
 	info := &containerInfo{
 		cid:               cid,
@@ -124,12 +133,18 @@ func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l 
 		goferFilestoreFDs: goferFilestoreFDs,
 		goferMountConfs:   goferMountConfs,
 	}
-	return r.restoreContainerInfo(l, info)
+	r.timer.Adopt(subcontainerTimeline)
+	return r.restoreContainerInfo(l, info, subcontainerTimeline)
 }
 
-func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
+// restoreContainerInfo restores a container.
+// It takes ownership of containerTimeline and will end it.
+func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo, containerTimeline *timing.Timeline) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	containerTiming := containerTimeline.Lease()
+	defer containerTiming.End()
+	containerTiming.Reached("restorer locked")
 
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {
@@ -142,12 +157,15 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 
 	r.containers = append(r.containers, info)
 
-	log.Infof("Restored container %d of %d", len(r.containers), r.totalContainers)
 	if log.IsLogging(log.Debug) {
 		for i, fd := range info.stdioFDs {
 			log.Debugf("Restore app FD: %d host FD: %d", i, fd.FD())
 		}
 	}
+	containerTiming.End()
+	log.Infof("Restored container %d of %d", len(r.containers), r.totalContainers)
+
+	// Non-container-specific restore work:
 
 	if len(r.containers) == r.totalContainers {
 		if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
@@ -175,6 +193,7 @@ func (r *restorer) restore(l *Loader) error {
 	// Create a new root network namespace with the network stack of the
 	// old kernel to preserve the existing network configuration.
 	oldStack, oldInetStack := createNetworkStackForRestore(l)
+	r.timer.Reached("netstack created")
 
 	// Reset the network stack in the network namespace to nil before
 	// replacing the kernel. This will not free the network stack when this
@@ -190,7 +209,9 @@ func (r *restorer) restore(l *Loader) error {
 	l.watchdog.Start()
 
 	// Release the kernel and replace it with a new one that will be restored into.
+	var oldNvidiaDriverVersion nvconf.DriverVersion
 	if l.k != nil {
+		oldNvidiaDriverVersion = l.k.NvidiaDriverVersion
 		l.k.Release()
 	}
 	l.k = &kernel.Kernel{
@@ -254,8 +275,13 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	// Load the state.
+	r.timer.Reached("loading kernel")
 	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader == nil, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, l.saveRestoreNet); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
+	}
+	r.timer.Reached("kernel loaded")
+	if oldNvidiaDriverVersion.Major() > 0 && !l.k.NvidiaDriverVersion.Equals(oldNvidiaDriverVersion) {
+		return fmt.Errorf("nvidia driver version changed during restore: was %v, now %v", oldNvidiaDriverVersion, l.k.NvidiaDriverVersion)
 	}
 
 	if r.asyncMFLoader != nil {
@@ -263,10 +289,12 @@ func (r *restorer) restore(l *Loader) error {
 			if err := r.asyncMFLoader.WaitMetadata(); err != nil {
 				return err
 			}
+			r.timer.Reached("MF metadata loaded")
 		} else {
 			if err := r.asyncMFLoader.Wait(); err != nil {
 				return err
 			}
+			r.timer.Reached("MFs loaded")
 		}
 	}
 
@@ -329,18 +357,23 @@ func (r *restorer) restore(l *Loader) error {
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
+	r.timer.Reached("Starting sandbox")
 	if err := r.readyToStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
 	}
 
 	r.stateFile.Close()
 
+	postRestoreThread := r.timer.Fork("postRestore")
 	go func() {
-		if err := postRestoreImpl(l); err != nil {
+		defer postRestoreThread.End()
+		postRestoreThread.Reached("scheduled")
+		if err := control.PostRestore(l.k, postRestoreThread); err != nil {
 			log.Warningf("Killing the sandbox after post restore work failed: %v", err)
 			l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 			return
 		}
+		postRestoreThread.Reached("post restore done")
 
 		// Now that post restore work succeeded, increment the checkpoint gen
 		// manually. The count was saved while the previous kernel was being saved
@@ -359,9 +392,19 @@ func (r *restorer) restore(l *Loader) error {
 		}
 
 		r.onRestoreDone()
+		postRestoreThread.Reached("kernel notified")
 
 		log.Infof("Restore successful")
 	}()
+
+	// Transfer ownership of the `timer` to a new goroutine.
+	// This is because `timer.Log` blocks until all timed tasks are finished,
+	// but some restore tasks may still run in the background, and we don't
+	// want to block this function until they finish.
+	timer := r.timer
+	r.timer = nil
+	go timer.Log()
+
 	return nil
 }
 
@@ -391,22 +434,12 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 	}
 	o.Metadata[ContainerSpecsKey] = specsStr
 
-	if err := preSaveImpl(l, o); err != nil {
-		return err
-	}
-
 	state := control.State{
 		Kernel:   l.k,
 		Watchdog: l.watchdog,
 	}
 	if err := state.Save(o, nil); err != nil {
 		return err
-	}
-
-	if o.Resume {
-		if err := postResumeImpl(l); err != nil {
-			return err
-		}
 	}
 	return nil
 }

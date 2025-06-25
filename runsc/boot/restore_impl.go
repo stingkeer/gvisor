@@ -19,24 +19,9 @@ package boot
 
 import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/runsc/config"
 )
-
-func preSaveImpl(*Loader, *control.SaveOpts) error {
-	return nil
-}
-
-// Precondition: The kernel should be running.
-func postRestoreImpl(*Loader) error {
-	return nil
-}
-
-// Precondition: The kernel should be running.
-func postResumeImpl(*Loader) error {
-	return nil
-}
 
 func newProcInternalData(conf *config.Config, _ *specs.Spec) *proc.InternalData {
 	return &proc.InternalData{

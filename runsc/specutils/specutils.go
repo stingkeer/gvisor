@@ -32,7 +32,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/config"
@@ -302,9 +301,13 @@ func ReadMounts(f *os.File) ([]specs.Mount, error) {
 }
 
 // ChangeMountType changes m.Type to the specified type. It may do necessary
-// amends to m.Options.
-func ChangeMountType(m *specs.Mount, newType string) {
-	m.Type = newType
+// amends to m.Options. It returns true if m was modified.
+func ChangeMountType(m *specs.Mount, newType string) bool {
+	updated := false
+	if m.Type != newType {
+		m.Type = newType
+		updated = true
+	}
 
 	// OCI spec allows bind mounts to be specified in options only. So if new type
 	// is not bind, remove bind/rbind from options.
@@ -316,10 +319,13 @@ func ChangeMountType(m *specs.Mount, newType string) {
 		for _, opt := range m.Options {
 			if opt != "rbind" && opt != "bind" {
 				newOpts = append(newOpts, opt)
+			} else {
+				updated = true
 			}
 		}
 		m.Options = newOpts
 	}
+	return updated
 }
 
 // Capabilities takes in spec and returns a TaskCapabilities corresponding to
@@ -366,11 +372,11 @@ func AllCapabilities() *specs.LinuxCapabilities {
 	}
 }
 
-// AllCapabilitiesUint64 returns a bitmask containing all capabilities set.
-func AllCapabilitiesUint64() uint64 {
-	var rv uint64
+// AllCapabilitiesSet returns a CapabilitySet containing all capabilities.
+func AllCapabilitiesSet() auth.CapabilitySet {
+	var rv auth.CapabilitySet
 	for _, cap := range capFromName {
-		rv |= bits.MaskOf64(int(cap))
+		rv.Add(cap)
 	}
 	return rv
 }

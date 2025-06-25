@@ -118,6 +118,9 @@ type Stack struct {
 	// TODO(gvisor.dev/issue/4595): S/R this field.
 	tables *IPTables `state:"nosave"`
 
+	// nftables is the nftables interface for packet filtering and manipulation rules.
+	nftables NFTablesInterface `state:"nosave"`
+
 	// restoredEndpoints is a list of endpoints that need to be restored if the
 	// stack is being restored.
 	restoredEndpoints []RestoredEndpoint
@@ -237,6 +240,9 @@ type Options struct {
 	// used to construct the initial iptables rules.
 	// all traffic.
 	IPTables *IPTables
+
+	// NFTables is the nftables interface for packet filtering and manipulation rules.
+	NFTables NFTablesInterface
 
 	// DefaultIPTables is an optional iptables rules constructor that is called
 	// if IPTables is nil. If both fields are nil, iptables will allow all
@@ -390,6 +396,7 @@ func New(opts Options) *Stack {
 		stats:                        opts.Stats.FillIn(),
 		handleLocal:                  opts.HandleLocal,
 		tables:                       opts.IPTables,
+		nftables:                     opts.NFTables,
 		icmpRateLimiter:              NewICMPRateLimiter(clock),
 		seed:                         secureRNG.Uint32(),
 		nudConfigs:                   opts.NUDConfigs,
@@ -1994,6 +2001,7 @@ func (s *Stack) ReplaceConfig(st *Stack) {
 		_ = s.NextNICID()
 	}
 	s.tables = st.tables
+	s.nftables = st.nftables
 }
 
 // Restore restarts the stack after a restore. This must be called after the
@@ -2009,6 +2017,11 @@ func (s *Stack) Restore() {
 	for _, e := range eps {
 		e.Restore(s)
 	}
+
+	// Make sure all the endpoints are loaded correctly before resuming the
+	// protocol level background workers.
+	tcpip.AsyncLoading.Wait()
+
 	// Now resume any protocol level background workers.
 	for _, p := range s.transportProtocols {
 		if saveRestoreEnabled {
@@ -2181,6 +2194,16 @@ func (s *Stack) IsInGroup(nicID tcpip.NICID, multicastAddr tcpip.Address) (bool,
 // IPTables returns the stack's iptables.
 func (s *Stack) IPTables() *IPTables {
 	return s.tables
+}
+
+// NFTables returns the stack's nftables.
+func (s *Stack) NFTables() NFTablesInterface {
+	return s.nftables
+}
+
+// SetNFTables sets the stack's nftables.
+func (s *Stack) SetNFTables(nft NFTablesInterface) {
+	s.nftables = nft
 }
 
 // ICMPLimit returns the maximum number of ICMP messages that can be sent
