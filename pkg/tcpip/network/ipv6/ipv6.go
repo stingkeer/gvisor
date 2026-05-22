@@ -2066,8 +2066,10 @@ func (e *endpoint) MainAddress() tcpip.AddressWithPrefix {
 
 // AcquireAssignedAddress implements stack.AddressableEndpoint.
 func (e *endpoint) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp bool, tempPEB stack.PrimaryEndpointBehavior, readOnly bool) stack.AddressEndpoint {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	if !readOnly || allowTemp {
+		e.mu.RLock()
+		defer e.mu.RUnlock()
+	}
 	return e.acquireAddressOrCreateTempLocked(localAddr, allowTemp, tempPEB, readOnly)
 }
 

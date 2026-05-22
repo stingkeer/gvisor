@@ -1412,14 +1412,18 @@ func (e *endpoint) MainAddress() tcpip.AddressWithPrefix {
 
 // AcquireAssignedAddress implements stack.AddressableEndpoint.
 func (e *endpoint) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp bool, tempPEB stack.PrimaryEndpointBehavior, readOnly bool) stack.AddressEndpoint {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	if !readOnly || allowTemp {
+		e.mu.RLock()
+		defer e.mu.RUnlock()
+	}
+
+	if readOnly {
+		return e.addressableEndpointState.AcquireAssignedAddressOrMatching(localAddr, nil, allowTemp, tempPEB, readOnly)
+	}
 
 	loopback := e.nic.IsLoopback()
 	return e.addressableEndpointState.AcquireAssignedAddressOrMatching(localAddr, func(addressEndpoint stack.AddressEndpoint) bool {
 		subnet := addressEndpoint.Subnet()
-		// IPv4 has a notion of a subnet broadcast address and considers the
-		// loopback interface bound to an address's whole subnet (on linux).
 		return subnet.IsBroadcast(localAddr) || (loopback && subnet.Contains(localAddr))
 	}, allowTemp, tempPEB, readOnly)
 }

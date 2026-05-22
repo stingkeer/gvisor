@@ -38,12 +38,6 @@ type AddressableEndpointState struct {
 	networkEndpoint NetworkEndpoint
 	options         AddressableEndpointStateOptions
 
-	// Lock ordering (from outer to inner lock ordering):
-	//
-	// AddressableEndpointState.mu
-	//   addressState.mu
-	//
-	// mu protects primary and endpointCount.
 	mu addressableEndpointStateRWMutex `state:"nosave"`
 	// TODO(b/361075310): Enable s/r for the below fields.
 	//
@@ -51,6 +45,9 @@ type AddressableEndpointState struct {
 	endpointCount int `state:"nosave"`
 	// endpoints uses sync.Map for lock-free reads (key: tcpip.Address, value: *addressState).
 	endpoints sync.Map `state:"nosave"`
+	// broadcastEndpoints caches broadcast addresses for O(1) lookup
+	// (key: tcpip.Address broadcast addr, value: *addressState).
+	broadcastEndpoints sync.Map `state:"nosave"`
 	// +checklocks:mu
 	primary []*addressState `state:"nosave"`
 }
@@ -142,6 +139,9 @@ func (a *AddressableEndpointState) releaseAddressStateLocked(addrState *addressS
 			oldPrimary[len(oldPrimary)-1] = nil
 			break
 		}
+	}
+	if bc := addrState.subnet.Broadcast(); bc.Len() > 0 {
+		a.broadcastEndpoints.Delete(bc)
 	}
 	a.endpoints.Delete(addrState.addr.Address)
 	a.endpointCount--
@@ -274,6 +274,9 @@ func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.Address
 		}
 		addrState.refs.InitRefs()
 		a.endpoints.Store(addr.Address, addrState)
+		if bc := addrState.subnet.Broadcast(); bc.Len() > 0 {
+			a.broadcastEndpoints.Store(bc, addrState)
+		}
 		a.endpointCount++
 		// We never promote an address to temporary - it can only be added as such.
 		// If we are actually adding a permanent address, it is promoted below.
@@ -578,6 +581,37 @@ func (a *AddressableEndpointState) acquirePrimaryAddressRLocked(remoteAddr, srcH
 // Regardless how the address was obtained, it will be acquired before it is
 // returned.
 func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tcpip.Address, f func(AddressEndpoint) bool, allowTemp bool, tempPEB PrimaryEndpointBehavior, readOnly bool) AddressEndpoint {
+	if readOnly {
+		if v, ok := a.endpoints.Load(localAddr); ok {
+			addrState := v.(*addressState)
+			if addrState.IsAssigned(allowTemp) {
+				return addrState
+			}
+		}
+
+		if f != nil {
+			if v, ok := a.broadcastEndpoints.Load(localAddr); ok {
+				addrState := v.(*addressState)
+				if addrState.IsAssigned(allowTemp) {
+					return addrState
+				}
+			}
+		}
+
+		if !allowTemp {
+			return nil
+		}
+
+		addr := localAddr.WithPrefix()
+		return &addressState{
+			addressableEndpointState: a,
+			addr:      addr,
+			subnet:    addr.Subnet(),
+			temporary: true,
+			kind:      Temporary,
+		}
+	}
+
 	lookup := func() *addressState {
 		if v, ok := a.endpoints.Load(localAddr); ok {
 			addrState := v.(*addressState)
@@ -585,19 +619,29 @@ func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tc
 				return nil
 			}
 
-			if !readOnly && !addrState.TryIncRef() {
-				panic(fmt.Sprintf("failed to increase the reference count for address = %s", addrState.addr))
+			if !addrState.TryIncRef() {
+				return nil
 			}
 
 			return addrState
 		}
 
 		if f != nil {
+			if v, ok := a.broadcastEndpoints.Load(localAddr); ok {
+				addrState := v.(*addressState)
+				if addrState.IsAssigned(allowTemp) {
+					if !addrState.TryIncRef() {
+						return nil
+					}
+					return addrState
+				}
+			}
+
 			var result *addressState
 			a.endpoints.Range(func(key, value any) bool {
 				addrState := value.(*addressState)
 				if addrState.IsAssigned(allowTemp) && f(addrState) {
-					if !readOnly && !addrState.TryIncRef() {
+					if !addrState.TryIncRef() {
 						return true
 					}
 					result = addrState
@@ -609,7 +653,7 @@ func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tc
 		}
 		return nil
 	}
-	// sync.Map provides lock-free reads, no RLock needed for lookup.
+
 	ep := lookup()
 
 	if ep != nil {
@@ -620,54 +664,22 @@ func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tc
 		return nil
 	}
 
-	// Acquire state lock in exclusive mode as we need to add a new temporary
-	// endpoint.
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Do the lookup again in case another goroutine added the address in the time
-	// we released and acquired the lock.
 	ep = lookup()
 	if ep != nil {
 		return ep
 	}
 
-	// Proceed to add a new temporary endpoint.
 	addr := localAddr.WithPrefix()
 	ep, err := a.addAndAcquireAddressLocked(addr, AddressProperties{PEB: tempPEB, Temporary: true}, Temporary)
 	if err != nil {
-		// addAndAcquireAddressLocked only returns an error if the address is
-		// already assigned but we just checked above if the address exists so we
-		// expect no error.
 		panic(fmt.Sprintf("a.addAndAcquireAddressLocked(%s, AddressProperties{PEB: %s}, false): %s", addr, tempPEB, err))
 	}
 
-	// From https://golang.org/doc/faq#nil_error:
-	//
-	// Under the covers, interfaces are implemented as two elements, a type T and
-	// a value V.
-	//
-	// An interface value is nil only if the V and T are both unset, (T=nil, V is
-	// not set), In particular, a nil interface will always hold a nil type. If we
-	// store a nil pointer of type *int inside an interface value, the inner type
-	// will be *int regardless of the value of the pointer: (T=*int, V=nil). Such
-	// an interface value will therefore be non-nil even when the pointer value V
-	// inside is nil.
-	//
-	// Since addAndAcquireAddressLocked returns a nil value with a non-nil type,
-	// we need to explicitly return nil below if ep is (a typed) nil.
 	if ep == nil {
 		return nil
-	}
-	if readOnly {
-		if ep.addressableEndpointState == a {
-			// Checklocks doesn't understand that we are logically guaranteed to have
-			// ep.mu locked already. We need to use checklocksignore to appease the
-			// analyzer.
-			ep.addressableEndpointState.decAddressRefLocked(ep) // +checklocksignore
-		} else {
-			ep.DecRef()
-		}
 	}
 	return ep
 }
