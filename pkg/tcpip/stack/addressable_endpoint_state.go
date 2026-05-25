@@ -215,26 +215,20 @@ func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.Address
 	var addrState *addressState
 	if v, ok := a.endpoints.Load(addr.Address); ok {
 		addrState = v.(*addressState)
-		if !permanent {
-			// We are adding a non-permanent address but the address exists. No need
-			// to go any further since we can only promote existing temporary/expired
-			// addresses to permanent.
-			return nil, &tcpip.ErrDuplicateAddress{}
-		}
 
 		addrState.mu.RLock()
 		if addrState.refs.ReadRefs() == 0 {
-			// Address is being cleaned up concurrently by decAddressRef.
-			// Treat as if it doesn't exist and create a new one below.
 			addrState.mu.RUnlock()
 			addrState = nil
 		} else {
 			isPermanent := addrState.kind.IsPermanent()
 			addrState.mu.RUnlock()
 
+			if !permanent {
+				return nil, &tcpip.ErrDuplicateAddress{}
+			}
+
 			if isPermanent {
-				// We are adding a permanent address but a permanent address already
-				// exists.
 				return nil, &tcpip.ErrDuplicateAddress{}
 			}
 
